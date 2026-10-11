@@ -172,13 +172,11 @@ void HnswIndex::add(std::int64_t id, const std::vector<float> &vector) {
   for (float x : vector)
     if (!std::isfinite(x))
       throw std::invalid_argument("vector values must be finite");
-  if (dimension_ == 0)
-    dimension_ = vector.size();
-  if (vector.size() != dimension_)
+  if (dimension_ != 0 && vector.size() != dimension_)
     throw std::invalid_argument("vector dimension mismatch");
-  for (const auto &n : nodes_)
-    if (n.id == id)
-      throw std::invalid_argument("duplicate vector ID");
+
+  if (ids_.find(id) != ids_.end())
+    throw std::invalid_argument("duplicate vector ID");
 
   Node fresh;
   fresh.id = id;
@@ -186,6 +184,9 @@ void HnswIndex::add(std::int64_t id, const std::vector<float> &vector) {
   fresh.level = random_level();
   fresh.neighbors.resize(static_cast<std::size_t>(fresh.level + 1));
   const auto index = nodes_.size();
+  ids_.insert(id);
+  if (dimension_ == 0)
+    dimension_ = vector.size();
   if (nodes_.empty()) {
     nodes_.push_back(std::move(fresh));
     entry_point_ = 0;

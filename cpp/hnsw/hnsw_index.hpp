@@ -2,6 +2,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <random>
+#include <unordered_set>
 #include <vector>
 
 namespace vectorforge {
@@ -33,6 +34,7 @@ private:
     int level = 0;
   };
   HnswConfig config_;
+  std::unordered_set<std::int64_t> ids_;
   std::vector<Node> nodes_;
   std::size_t dimension_ = 0;
   std::size_t entry_point_ = 0;

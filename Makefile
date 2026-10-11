@@ -25,3 +25,12 @@ $(HNSW_TEST): tests/hnsw_smoke.cpp $(HNSW_SRC) cpp/hnsw/hnsw_index.hpp
 
 hnsw-test: $(HNSW_TEST)
 	./$(HNSW_TEST)
+HNSW_BENCHMARK := build/hnsw_benchmark
+
+$(HNSW_BENCHMARK): cpp/hnsw_benchmark.cpp cpp/hnsw/hnsw_index.cpp cpp/hnsw/hnsw_index.hpp
+	mkdir -p build
+	$(CXX) $(CXXFLAGS) -Icpp cpp/hnsw_benchmark.cpp cpp/hnsw/hnsw_index.cpp -o $(HNSW_BENCHMARK)
+
+.PHONY: hnsw-benchmark
+
+hnsw-benchmark: $(HNSW_BENCHMARK)
