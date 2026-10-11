@@ -9,6 +9,16 @@
 
 namespace vectorforge {
 namespace {
+double vector_norm(const std::vector<float> &values) {
+  double sum = 0.0;
+
+  for (const float value : values) {
+    const double v = static_cast<double>(value);
+    sum += v * v;
+  }
+
+  return std::sqrt(sum);
+}
 struct Scored {
   float score;
   std::size_t index;
@@ -40,21 +50,37 @@ HnswIndex::HnswIndex(HnswConfig config) : config_(config), rng_(config.seed) {
 std::size_t HnswIndex::size() const noexcept { return nodes_.size(); }
 std::size_t HnswIndex::dimension() const noexcept { return dimension_; }
 
+float HnswIndex::cosine_with_norms(const std::vector<float> &a, double norm_a,
+                                   const std::vector<float> &b,
+                                   double norm_b) const {
+  if (a.size() != b.size()) {
+    throw std::invalid_argument("cosine dimension mismatch");
+  }
+
+  if (norm_a == 0.0 || norm_b == 0.0) {
+    return 0.0F;
+  }
+
+  double dot = 0.0;
+
+  for (std::size_t i = 0; i < a.size(); ++i) {
+    dot += static_cast<double>(a[i]) * static_cast<double>(b[i]);
+  }
+
+  return static_cast<float>(dot / (norm_a * norm_b));
+}
+
 float HnswIndex::cosine(const std::vector<float> &a,
                         const std::vector<float> &b) const {
-  float dot = 0.0F, na = 0.0F, nb = 0.0F;
-  for (std::size_t i = 0; i < a.size(); ++i) {
-    dot += a[i] * b[i];
-    na += a[i] * a[i];
-    nb += b[i] * b[i];
-  }
-  if (na == 0.0F || nb == 0.0F)
-    return 0.0F;
-  return dot / (std::sqrt(na) * std::sqrt(nb));
+  const double norm_a = static_cast<double>(vector_norm(a));
+  const double norm_b = static_cast<double>(vector_norm(b));
+
+  return cosine_with_norms(a, norm_a, b, norm_b);
 }
 int HnswIndex::random_level() {
   const double u = std::max(std::generate_canonical<double, 53>(rng_),
                             std::numeric_limits<double>::min());
+
   return static_cast<int>(-std::log(u) /
                           std::log(static_cast<double>(config_.M)));
 }
@@ -78,7 +104,7 @@ std::size_t HnswIndex::greedy(const std::vector<float> &query,
   }
   return current;
 }
-std::vector<std::size_t>
+std::vector<HnswIndex::ScoredCandidate>
 HnswIndex::search_layer(const std::vector<float> &query,
                         const std::vector<std::size_t> &entries, std::size_t ef,
                         int layer) const {
@@ -136,25 +162,29 @@ HnswIndex::search_layer(const std::vector<float> &query,
     }
   }
 
-  std::vector<std::size_t> results;
-  results.reserve(best.size());
+  std::vector<Scored> scored_results;
+  scored_results.reserve(best.size());
 
   while (!best.empty()) {
-    results.push_back(best.top().index);
+    scored_results.push_back(best.top());
     best.pop();
   }
 
-  std::sort(results.begin(), results.end(),
-            [this, &query](std::size_t a, std::size_t b) {
-              const float score_a = cosine(query, nodes_[a].vector);
-              const float score_b = cosine(query, nodes_[b].vector);
-
-              if (score_a != score_b) {
-                return score_a > score_b;
+  std::sort(scored_results.begin(), scored_results.end(),
+            [this](const Scored &a, const Scored &b) {
+              if (a.score != b.score) {
+                return a.score > b.score;
               }
 
-              return nodes_[a].id < nodes_[b].id;
+              return nodes_[a.index].id < nodes_[b.index].id;
             });
+
+  std::vector<ScoredCandidate> results;
+  results.reserve(scored_results.size());
+
+  for (const auto &entry : scored_results) {
+    results.push_back({entry.score, entry.index});
+  }
 
   return results;
 }
@@ -166,75 +196,83 @@ HnswIndex::select_neighbors(const std::vector<float> &query,
     return {};
   }
 
-  // Remove duplicate candidate indices.
-  std::vector<std::size_t> unique_candidates;
-  unique_candidates.reserve(candidates.size());
+  struct RankedCandidate {
+    std::size_t index;
+    float score;
+  };
+
+  std::vector<RankedCandidate> ranked;
+  ranked.reserve(candidates.size());
 
   std::unordered_set<std::size_t> seen;
   seen.reserve(candidates.size());
 
+  // Deduplicate candidates and compute each query similarity once.
   for (const auto candidate : candidates) {
+    if (candidate >= nodes_.size()) {
+      continue;
+    }
+
     if (seen.insert(candidate).second) {
-      unique_candidates.push_back(candidate);
+      ranked.push_back({candidate, cosine(query, nodes_[candidate].vector)});
     }
   }
 
-  // Rank candidates by similarity to the query node.
-  std::sort(unique_candidates.begin(), unique_candidates.end(),
-            [this, &query](std::size_t a, std::size_t b) {
-              const float score_a = cosine(query, nodes_[a].vector);
-              const float score_b = cosine(query, nodes_[b].vector);
+  if (ranked.empty()) {
+    return {};
+  }
 
-              if (score_a != score_b) {
-                return score_a > score_b;
+  // Sort using cached scores.
+  std::sort(ranked.begin(), ranked.end(),
+            [this](const RankedCandidate &a, const RankedCandidate &b) {
+              if (a.score != b.score) {
+                return a.score > b.score;
               }
 
-              return nodes_[a].id < nodes_[b].id;
+              return nodes_[a.index].id < nodes_[b.index].id;
             });
 
+  const std::size_t target = std::min(limit, ranked.size());
+
   std::vector<std::size_t> selected;
-  selected.reserve(std::min(limit, unique_candidates.size()));
+  selected.reserve(target);
 
-  // HNSW diversity heuristic:
-  // Accept a candidate only if it is closer to the query node than
-  // it is to every neighbor already selected.
-  for (const auto candidate : unique_candidates) {
-    const float query_similarity = cosine(query, nodes_[candidate].vector);
-
+  // Preserve the HNSW diversity heuristic.
+  for (const auto &candidate : ranked) {
     bool diverse = true;
 
     for (const auto chosen : selected) {
-      const float neighbor_similarity =
-          cosine(nodes_[candidate].vector, nodes_[chosen].vector);
+      const float neighbor_similarity = cosine_with_norms(
+          nodes_[candidate.index].vector, nodes_[candidate.index].norm,
+          nodes_[chosen].vector, nodes_[chosen].norm);
 
-      if (neighbor_similarity >= query_similarity) {
+      if (neighbor_similarity >= candidate.score) {
         diverse = false;
         break;
       }
     }
 
     if (diverse) {
-      selected.push_back(candidate);
+      selected.push_back(candidate.index);
 
-      if (selected.size() == limit) {
+      if (selected.size() == target) {
         break;
       }
     }
   }
 
-  // If the diversity heuristic rejects too many candidates,
-  // fill the remaining slots with the highest-ranked unused candidates.
-  if (selected.size() < std::min(limit, unique_candidates.size())) {
+  // Preserve fallback behavior if diversity selection rejects candidates.
+  if (selected.size() < target) {
     std::unordered_set<std::size_t> selected_set(selected.begin(),
                                                  selected.end());
 
-    for (const auto candidate : unique_candidates) {
-      if (selected.size() >= limit) {
+    for (const auto &candidate : ranked) {
+      if (selected.size() >= target) {
         break;
       }
 
-      if (selected_set.insert(candidate).second) {
-        selected.push_back(candidate);
+      if (selected_set.insert(candidate.index).second) {
+        selected.push_back(candidate.index);
       }
     }
   }
@@ -270,6 +308,7 @@ void HnswIndex::add(std::int64_t id, const std::vector<float> &vector) {
   Node fresh;
   fresh.id = id;
   fresh.vector = vector;
+  fresh.norm = vector_norm(vector);
   fresh.level = random_level();
   fresh.neighbors.resize(static_cast<std::size_t>(fresh.level + 1));
   const auto index = nodes_.size();
@@ -290,8 +329,16 @@ void HnswIndex::add(std::int64_t id, const std::vector<float> &vector) {
 
   const int stop = std::min(nodes_[index].level, max_level_);
   for (int layer = stop; layer >= 0; --layer) {
-    auto candidates =
+    auto scored_candidates =
         search_layer(vector, {entry}, config_.ef_construction, layer);
+
+    std::vector<std::size_t> candidates;
+    candidates.reserve(scored_candidates.size());
+
+    for (const auto &candidate : scored_candidates) {
+      candidates.push_back(candidate.index);
+    }
+
     connect(index, candidates, layer);
     if (!nodes_[index].neighbors[static_cast<std::size_t>(layer)].empty())
       entry = nodes_[index].neighbors[static_cast<std::size_t>(layer)][0];
@@ -319,10 +366,14 @@ std::vector<SearchResult> HnswIndex::search(const std::vector<float> &query,
   for (int layer = max_level_; layer > 0; --layer)
     entry = greedy(query, entry, layer);
   const auto candidates = search_layer(query, {entry}, ef, 0);
+
   std::vector<SearchResult> result;
+  result.reserve(std::min(k, candidates.size()));
+
   for (std::size_t i = 0; i < std::min(k, candidates.size()); ++i) {
-    const auto idx = candidates[i];
-    result.push_back({nodes_[idx].id, cosine(query, nodes_[idx].vector)});
+    const auto &candidate = candidates[i];
+
+    result.push_back({nodes_[candidate.index].id, candidate.score});
   }
   return result;
 }

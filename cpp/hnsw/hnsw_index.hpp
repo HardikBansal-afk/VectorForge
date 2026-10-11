@@ -30,8 +30,13 @@ private:
   struct Node {
     std::int64_t id{};
     std::vector<float> vector;
+    double norm = 0.0;
     std::vector<std::vector<std::size_t>> neighbors;
     int level = 0;
+  };
+  struct ScoredCandidate {
+    float score;
+    std::size_t index;
   };
   HnswConfig config_;
   std::unordered_set<std::int64_t> ids_;
@@ -42,10 +47,14 @@ private:
   std::mt19937 rng_;
   [[nodiscard]] float cosine(const std::vector<float> &a,
                              const std::vector<float> &b) const;
+  [[nodiscard]] float cosine_with_norms(const std::vector<float> &a,
+                                        double norm_a,
+                                        const std::vector<float> &b,
+                                        double norm_b) const;
   [[nodiscard]] int random_level();
   [[nodiscard]] std::size_t greedy(const std::vector<float> &query,
                                    std::size_t entry, int layer) const;
-  [[nodiscard]] std::vector<std::size_t>
+  [[nodiscard]] std::vector<ScoredCandidate>
   search_layer(const std::vector<float> &query,
                const std::vector<std::size_t> &entries, std::size_t ef,
                int layer) const;
