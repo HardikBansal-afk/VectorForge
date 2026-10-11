@@ -78,80 +78,169 @@ std::size_t HnswIndex::greedy(const std::vector<float> &query,
   }
   return current;
 }
-
 std::vector<std::size_t>
 HnswIndex::search_layer(const std::vector<float> &query,
                         const std::vector<std::size_t> &entries, std::size_t ef,
                         int layer) const {
   std::priority_queue<Scored, std::vector<Scored>, BestFirst> candidates;
   std::priority_queue<Scored, std::vector<Scored>, WorstFirst> best;
+
   std::vector<unsigned char> visited(nodes_.size(), 0);
-  for (auto e : entries) {
-    if (visited[e])
+
+  for (const auto entry : entries) {
+    if (entry >= nodes_.size() || layer < 0 ||
+        static_cast<std::size_t>(layer) >= nodes_[entry].neighbors.size()) {
       continue;
-    visited[e] = 1;
-    const float s = cosine(query, nodes_[e].vector);
-    candidates.push({s, e});
-    best.push({s, e});
+    }
+
+    if (visited[entry]) {
+      continue;
+    }
+
+    visited[entry] = 1;
+
+    const float score = cosine(query, nodes_[entry].vector);
+
+    candidates.push({score, entry});
+    best.push({score, entry});
   }
+
   while (!candidates.empty()) {
     const auto current = candidates.top();
     candidates.pop();
-    if (best.size() >= ef && current.score < best.top().score)
+
+    if (best.size() >= ef && current.score < best.top().score) {
       break;
-    for (auto n :
+    }
+
+    for (const auto neighbor :
          nodes_[current.index].neighbors[static_cast<std::size_t>(layer)]) {
-      if (visited[n])
+      if (visited[neighbor]) {
         continue;
-      visited[n] = 1;
-      const float s = cosine(query, nodes_[n].vector);
-      if (best.size() < ef || s > best.top().score ||
-          (s == best.top().score &&
-           nodes_[n].id < nodes_[best.top().index].id)) {
-        candidates.push({s, n});
-        best.push({s, n});
-        if (best.size() > ef)
+      }
+
+      visited[neighbor] = 1;
+
+      const float score = cosine(query, nodes_[neighbor].vector);
+
+      if (best.size() < ef || score > best.top().score ||
+          (score == best.top().score &&
+           nodes_[neighbor].id < nodes_[best.top().index].id)) {
+        candidates.push({score, neighbor});
+        best.push({score, neighbor});
+
+        if (best.size() > ef) {
           best.pop();
+        }
       }
     }
   }
-  std::vector<std::size_t> out;
-  out.reserve(best.size());
+
+  std::vector<std::size_t> results;
+  results.reserve(best.size());
+
   while (!best.empty()) {
-    out.push_back(best.top().index);
+    results.push_back(best.top().index);
     best.pop();
   }
-  std::sort(out.begin(), out.end(), [this, &query](auto a, auto b) {
-    const auto sa = cosine(query, nodes_[a].vector);
-    const auto sb = cosine(query, nodes_[b].vector);
-    if (sa != sb)
-      return sa > sb;
-    return nodes_[a].id < nodes_[b].id;
-  });
-  return out;
-}
 
+  std::sort(results.begin(), results.end(),
+            [this, &query](std::size_t a, std::size_t b) {
+              const float score_a = cosine(query, nodes_[a].vector);
+              const float score_b = cosine(query, nodes_[b].vector);
+
+              if (score_a != score_b) {
+                return score_a > score_b;
+              }
+
+              return nodes_[a].id < nodes_[b].id;
+            });
+
+  return results;
+}
 std::vector<std::size_t>
 HnswIndex::select_neighbors(const std::vector<float> &query,
                             const std::vector<std::size_t> &candidates,
                             std::size_t limit) const {
-  auto out = candidates;
-  std::sort(out.begin(), out.end(), [this, &query](auto a, auto b) {
-    const auto sa = cosine(query, nodes_[a].vector);
-    const auto sb = cosine(query, nodes_[b].vector);
-    if (sa != sb)
-      return sa > sb;
-    return nodes_[a].id < nodes_[b].id;
-  });
-  std::unordered_set<std::size_t> seen;
-  out.erase(std::remove_if(out.begin(), out.end(),
-                           [&seen](auto x) { return !seen.insert(x).second; }),
-            out.end());
-  if (out.size() > limit)
-    out.resize(limit);
-  return out;
-}
+  if (limit == 0 || candidates.empty()) {
+    return {};
+  }
 
+  // Remove duplicate candidate indices.
+  std::vector<std::size_t> unique_candidates;
+  unique_candidates.reserve(candidates.size());
+
+  std::unordered_set<std::size_t> seen;
+  seen.reserve(candidates.size());
+
+  for (const auto candidate : candidates) {
+    if (seen.insert(candidate).second) {
+      unique_candidates.push_back(candidate);
+    }
+  }
+
+  // Rank candidates by similarity to the query node.
+  std::sort(unique_candidates.begin(), unique_candidates.end(),
+            [this, &query](std::size_t a, std::size_t b) {
+              const float score_a = cosine(query, nodes_[a].vector);
+              const float score_b = cosine(query, nodes_[b].vector);
+
+              if (score_a != score_b) {
+                return score_a > score_b;
+              }
+
+              return nodes_[a].id < nodes_[b].id;
+            });
+
+  std::vector<std::size_t> selected;
+  selected.reserve(std::min(limit, unique_candidates.size()));
+
+  // HNSW diversity heuristic:
+  // Accept a candidate only if it is closer to the query node than
+  // it is to every neighbor already selected.
+  for (const auto candidate : unique_candidates) {
+    const float query_similarity = cosine(query, nodes_[candidate].vector);
+
+    bool diverse = true;
+
+    for (const auto chosen : selected) {
+      const float neighbor_similarity =
+          cosine(nodes_[candidate].vector, nodes_[chosen].vector);
+
+      if (neighbor_similarity >= query_similarity) {
+        diverse = false;
+        break;
+      }
+    }
+
+    if (diverse) {
+      selected.push_back(candidate);
+
+      if (selected.size() == limit) {
+        break;
+      }
+    }
+  }
+
+  // If the diversity heuristic rejects too many candidates,
+  // fill the remaining slots with the highest-ranked unused candidates.
+  if (selected.size() < std::min(limit, unique_candidates.size())) {
+    std::unordered_set<std::size_t> selected_set(selected.begin(),
+                                                 selected.end());
+
+    for (const auto candidate : unique_candidates) {
+      if (selected.size() >= limit) {
+        break;
+      }
+
+      if (selected_set.insert(candidate).second) {
+        selected.push_back(candidate);
+      }
+    }
+  }
+
+  return selected;
+}
 void HnswIndex::connect(std::size_t fresh,
                         const std::vector<std::size_t> &candidates, int layer) {
   const auto l = static_cast<std::size_t>(layer);
